@@ -215,6 +215,23 @@ class PerformanceTracker:
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
+        live_path = self.data_dir / "daily" / f"{date_str}_live.json"
+        if live_path.exists():
+            with open(live_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            trades = data.get("trades", [])
+            paper_signals = data.get("paper_signals", [])
+            pnls = [t.get("net_pnl", t.get("pnl", 0)) for t in trades]
+            return {
+                "date": date_str,
+                "trading_mode": data.get("trading_mode", self.trading_mode),
+                "trades": trades,
+                "paper_signals": paper_signals,
+                "total_trades": len(trades),
+                "daily_pnl": sum(pnls),
+                "updated_at": data.get("updated_at", ""),
+                "source": "incremental_live",
+            }
         # 如果文件不存在但有當日數據，回傳即時計算結果
         if date_str == datetime.now().strftime("%Y-%m-%d") and (self.today_trades or self.paper_signals):
             daily = self._build_daily_summary(date_str, self.starting_balance)

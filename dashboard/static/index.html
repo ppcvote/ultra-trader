@@ -637,6 +637,10 @@ body::before {
                     @click="switchTimeframe(tf)">
               {{ tf }}m
             </button>
+            <button :class="['tf-btn', showTradeMarkers ? 'active' : '']"
+                    @click="toggleTradeMarkers">
+              {{ showTradeMarkers ? '隱藏標記' : '顯示標記' }}
+            </button>
           </div>
         </div>
       </div>
@@ -1191,7 +1195,9 @@ createApp({
     let entryPriceLine = null;
     let slPriceLine = null;
     let tpPriceLine = null;
+    const showTradeMarkers = ref(true);
     let tradeMarkers = [];
+    let historyTradeMarkers = [];
     const seenTradeKeys = new Set();
     let currentCandle = null;
     let lastBarTime = null;
@@ -1407,8 +1413,9 @@ createApp({
             color: isClose ? '#F59E0B' : (isBuy ? '#10B981' : '#EF4444'),
             shape: isClose ? 'square' : (isBuy ? 'arrowUp' : 'arrowDown'),
             text: isClose ? 'EXIT' : (isBuy ? 'BUY' : 'SELL'),
+            instrument: data.instrument || activeInstrument.value,
           });
-          candleSeries.setMarkers(tradeMarkers.slice().sort((a, b) => a.time - b.time));
+          setAllTradeMarkers();
         }
       }
 
@@ -1510,11 +1517,121 @@ createApp({
           }
         } catch (emaErr) { console.warn('[EMA]', emaErr); }
 
+        await loadHistoricalTradeMarkers(data);
         updatePositionLines();
         // Redraw trend lines after setData() clears LineSeries data
         redrawAllDrawings();
       } catch (e) { console.error('[fetchKbars]', e); }
       _fetchingKbars = false;
+    }
+
+    function setAllTradeMarkers() {
+      if (!candleSeries) return;
+      if (!showTradeMarkers.value) {
+        candleSeries.setMarkers([]);
+        return;
+      }
+
+      const active = activeInstrument.value;
+      const seen = new Set();
+      const merged = [];
+      for (const marker of [...historyTradeMarkers, ...tradeMarkers]) {
+        if (marker.instrument && active && marker.instrument !== active) continue;
+        const key = `${marker.instrument || ''}|${marker.time}|${marker.text}|${marker.position}|${marker.color}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(marker);
+      }
+      candleSeries.setMarkers(merged.sort((a, b) => a.time - b.time));
+    }
+
+    function toggleTradeMarkers() {
+      showTradeMarkers.value = !showTradeMarkers.value;
+      setAllTradeMarkers();
+    }
+
+    function localDateFromIso(isoString) {
+      try {
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'Asia/Taipei',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+        }).formatToParts(new Date(isoString));
+        const byType = Object.fromEntries(parts.map(p => [p.type, p.value]));
+        return `${byType.year}-${byType.month}-${byType.day}`;
+      } catch (e) {
+        return new Date(isoString).toISOString().slice(0, 10);
+      }
+    }
+
+    function makeTradeMarker({ time, action, price, instrument }) {
+      if (!time || !price) return null;
+      const normalized = (action || '').toLowerCase();
+      const isBuy = normalized === 'buy';
+      const isSell = normalized === 'sell';
+      const isClose = normalized === 'close' || normalized === 'exit';
+      if (!isBuy && !isSell && !isClose) return null;
+      return {
+        time: toChartTime(time),
+        position: isBuy ? 'belowBar' : 'aboveBar',
+        color: isClose ? '#F59E0B' : (isBuy ? '#10B981' : '#EF4444'),
+        shape: isClose ? 'square' : (isBuy ? 'arrowUp' : 'arrowDown'),
+        text: isClose ? 'EXIT' : (isBuy ? 'BUY' : 'SELL'),
+        instrument,
+      };
+    }
+
+    function markersFromDailyPerformance(data, instrument) {
+      const markers = [];
+      for (const trade of data.trades || []) {
+        const tradeInst = trade.instrument || instrument;
+        if (tradeInst !== instrument) continue;
+        const entryAction = trade.side === 'short' ? 'sell' : 'buy';
+        const entryMarker = makeTradeMarker({
+          time: trade.entry_time,
+          action: entryAction,
+          price: trade.entry_price,
+          instrument: tradeInst,
+        });
+        if (entryMarker) markers.push(entryMarker);
+        const exitMarker = makeTradeMarker({
+          time: trade.exit_time,
+          action: 'close',
+          price: trade.exit_price,
+          instrument: tradeInst,
+        });
+        if (exitMarker) markers.push(exitMarker);
+      }
+
+      for (const signal of data.paper_signals || []) {
+        const signalInst = signal.instrument || instrument;
+        if (signalInst !== instrument) continue;
+        const marker = makeTradeMarker({
+          time: signal.time,
+          action: signal.action,
+          price: signal.price,
+          instrument: signalInst,
+        });
+        if (marker) markers.push(marker);
+      }
+      return markers;
+    }
+
+    async function loadHistoricalTradeMarkers(kbars) {
+      const instrument = activeInstrument.value || 'TMF';
+      const dates = [...new Set((kbars || []).map(k => localDateFromIso(k.time)).filter(Boolean))];
+      const markers = [];
+      for (const date of dates) {
+        try {
+          const r = await fetch(`/api/performance/daily/${date}`);
+          if (!r.ok) continue;
+          const data = await r.json();
+          markers.push(...markersFromDailyPerformance(data, instrument));
+        } catch (e) {}
+      }
+      historyTradeMarkers = markers;
+      setAllTradeMarkers();
     }
 
     function updatePositionLines() {
@@ -2592,6 +2709,7 @@ createApp({
       drawingMode, drawingColor, drawingWidth, drawnLines, selectedDrawing,
       toggleDrawing, undoLastLine, clearAllLines, removeDrawingAt, promptHlinePrice,
       engineAction, setRiskProfile, switchTimeframe, refreshIntel,
+      showTradeMarkers, toggleTradeMarkers,
     };
   },
 }).mount('#app');
