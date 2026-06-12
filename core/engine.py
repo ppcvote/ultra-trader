@@ -143,6 +143,10 @@ class TradingEngine:
         self._EXIT_MAX_RETRIES = 3           # 出場最多重試 3 次，超過強制重置持倉
         self._exiting: set = set()           # 正在執行出場的商品（防止雙重平倉）
         self._exit_lock = threading.Lock()   # 保護 _exiting set 的線程安全
+        self._market_data_gap_until: dict[str, datetime] = {}
+        self._last_price_anomaly: dict[str, dict] = {}
+        self._PRICE_BASELINE_MAX_AGE_SEC = 180
+        self._DATA_GAP_HOLD_SEC = 180
 
     def initialize(self):
         """初始化所有元件"""
@@ -910,6 +914,13 @@ class TradingEngine:
         if self._is_order_cooled_down(instrument):
             return
 
+        hold_until = self._market_data_gap_until.get(instrument)
+        if hold_until:
+            if datetime.now() < hold_until:
+                logger.info(f"[{instrument}] 資料斷層觀察中，跳過進場至 {hold_until.isoformat()}")
+                return
+            self._market_data_gap_until.pop(instrument, None)
+
         pipeline = self.pipelines[instrument]
         price = pipeline.snapshot.price
 
@@ -1232,32 +1243,129 @@ class TradingEngine:
             logger.warning(f"[RECONCILE] 持倉核對失敗: {e}")
 
     def _check_price_anomaly(self):
-        """價格異常偵測 — 超過 5x ATR 自動暫停交易"""
+        """價格異常偵測 — 超過 5x ATR 自動暫停交易。
+
+        If the previous baseline is stale, treat the first new quote as a data
+        gap reset instead of a bad tick. This preserves the emergency guard for
+        true short-window jumps while preventing long tick gaps from halting the
+        engine incorrectly.
+        """
         for inst in self.instruments:
             pipeline = self.pipelines.get(inst)
             if not pipeline or not pipeline.snapshot or pipeline.snapshot.atr <= 0:
                 continue
             price = pipeline.aggregator.current_price
             atr = pipeline.snapshot.atr
+            now = datetime.now()
             if not hasattr(pipeline, '_last_heartbeat_price'):
                 pipeline._last_heartbeat_price = price
+                pipeline._last_heartbeat_at = now
+                self._last_price_anomaly[inst] = {
+                    "status": "baseline",
+                    "severity": "normal",
+                    "triggered": False,
+                    "checked_at": now.isoformat(),
+                    "price": round(price, 1),
+                    "baseline": round(price, 1),
+                    "baseline_at": now.isoformat(),
+                    "elapsed_seconds": 0,
+                    "hold_until": None,
+                    "deviation": 0,
+                    "atr": round(atr, 1),
+                    "threshold": round(atr * 5, 1),
+                }
                 continue
+
+            baseline_at = getattr(pipeline, '_last_heartbeat_at', None)
+            elapsed = (now - baseline_at).total_seconds() if isinstance(baseline_at, datetime) else 0
             deviation = abs(price - pipeline._last_heartbeat_price)
+            if elapsed > self._PRICE_BASELINE_MAX_AGE_SEC:
+                previous_price = pipeline._last_heartbeat_price
+                hold_until = now + timedelta(seconds=self._DATA_GAP_HOLD_SEC)
+                self._market_data_gap_until[inst] = hold_until
+                logger.warning(
+                    f"[ANOMALY] {inst} baseline stale: elapsed={elapsed:.0f}s, "
+                    f"reset baseline {previous_price:.1f} → {price:.1f}; "
+                    f"hold new entries until {hold_until.isoformat()}"
+                )
+                self._last_price_anomaly[inst] = {
+                    "status": "data_gap_reset",
+                    "severity": "warning",
+                    "triggered": False,
+                    "checked_at": now.isoformat(),
+                    "price": round(price, 1),
+                    "baseline": round(previous_price, 1),
+                    "new_baseline": round(price, 1),
+                    "baseline_at": baseline_at.isoformat() if isinstance(baseline_at, datetime) else None,
+                    "elapsed_seconds": round(elapsed, 0),
+                    "hold_until": hold_until.isoformat(),
+                    "deviation": round(deviation, 1),
+                    "atr": round(atr, 1),
+                    "threshold": round(atr * 5, 1),
+                }
+                pipeline._last_heartbeat_price = price
+                pipeline._last_heartbeat_at = now
+                continue
+
             if deviation > atr * 5:
                 # 嚴重異常：自動觸發熔斷保護帳戶
+                reason = f"價格異常: {inst} 偏離 {deviation:.0f} 點"
                 logger.error(
                     f"[ANOMALY] {inst} 價格劇烈異常: {pipeline._last_heartbeat_price:.1f} → {price:.1f}"
                     f"（偏離 {deviation:.1f} > 5×ATR {atr * 5:.1f}）— 自動暫停交易！"
                 )
                 if self.risk_manager:
-                    self.risk_manager.circuit_breaker.on_connection_lost()
-                    self.risk_manager.circuit_breaker._halt_reason = f"價格異常: {inst} 偏離 {deviation:.0f} 點"
+                    self.risk_manager.circuit_breaker.on_price_anomaly(reason)
+                self._last_price_anomaly[inst] = {
+                    "status": "triggered",
+                    "severity": "danger",
+                    "triggered": True,
+                    "checked_at": now.isoformat(),
+                    "price": round(price, 1),
+                    "baseline": round(pipeline._last_heartbeat_price, 1),
+                    "baseline_at": baseline_at.isoformat() if isinstance(baseline_at, datetime) else None,
+                    "elapsed_seconds": round(elapsed, 0),
+                    "hold_until": None,
+                    "deviation": round(deviation, 1),
+                    "atr": round(atr, 1),
+                    "threshold": round(atr * 5, 1),
+                }
             elif deviation > atr * 3:
                 logger.warning(
                     f"[ANOMALY] {inst} 價格異常波動: {pipeline._last_heartbeat_price:.1f} → {price:.1f}"
                     f"（偏離 {deviation:.1f} > 3×ATR {atr * 3:.1f}）"
                 )
+                self._last_price_anomaly[inst] = {
+                    "status": "warning",
+                    "severity": "warning",
+                    "triggered": False,
+                    "checked_at": now.isoformat(),
+                    "price": round(price, 1),
+                    "baseline": round(pipeline._last_heartbeat_price, 1),
+                    "baseline_at": baseline_at.isoformat() if isinstance(baseline_at, datetime) else None,
+                    "elapsed_seconds": round(elapsed, 0),
+                    "hold_until": None,
+                    "deviation": round(deviation, 1),
+                    "atr": round(atr, 1),
+                    "threshold": round(atr * 3, 1),
+                }
+            else:
+                self._last_price_anomaly[inst] = {
+                    "status": "normal",
+                    "severity": "normal",
+                    "triggered": False,
+                    "checked_at": now.isoformat(),
+                    "price": round(price, 1),
+                    "baseline": round(pipeline._last_heartbeat_price, 1),
+                    "baseline_at": baseline_at.isoformat() if isinstance(baseline_at, datetime) else None,
+                    "elapsed_seconds": round(elapsed, 0),
+                    "hold_until": None,
+                    "deviation": round(deviation, 1),
+                    "atr": round(atr, 1),
+                    "threshold": round(atr * 5, 1),
+                }
             pipeline._last_heartbeat_price = price
+            pipeline._last_heartbeat_at = now
 
     def _broadcast(self, msg_type: str, data: dict):
         if self._ws_broadcast:

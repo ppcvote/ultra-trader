@@ -46,6 +46,7 @@ class CircuitBreaker:
         self._state = CircuitState.ACTIVE
         self._cooldown_until: Optional[datetime] = None
         self._halt_reason: str = ""
+        self._halt_type: str = ""
         self._trade_timestamps: list[datetime] = []
         self._daily_loss: float = 0.0
         self._consecutive_losses: int = 0
@@ -70,6 +71,7 @@ class CircuitBreaker:
                     self._consecutive_losses = 0
                     self._state = CircuitState.ACTIVE
                     self._halt_reason = ""
+                    self._halt_type = ""
                     logger.info("🔄 新交易日，熔斷自動重置")
             return self._state
 
@@ -117,6 +119,7 @@ class CircuitBreaker:
             if self._daily_loss >= self.max_daily_loss:
                 self._state = CircuitState.HALTED
                 self._halt_reason = f"每日虧損超限: {self._daily_loss:,.0f} 元 >= {self.max_daily_loss:,.0f} 元"
+                self._halt_type = "daily_loss"
                 logger.warning(f"🛑 熔斷觸發: {self._halt_reason}")
                 return
 
@@ -139,6 +142,7 @@ class CircuitBreaker:
             if pnl < 0 and expected_max_loss > 0 and abs(pnl) > expected_max_loss * 2:
                 self._state = CircuitState.EMERGENCY_STOP
                 self._halt_reason = f"單筆異常虧損: {pnl:,.0f} 元（預期最大 {expected_max_loss:,.0f} 元）"
+                self._halt_type = "abnormal_loss"
                 logger.error(f"🚨 緊急停機: {self._halt_reason}")
                 return
 
@@ -147,14 +151,28 @@ class CircuitBreaker:
         with self._lock:
             self._state = CircuitState.EMERGENCY_STOP
             self._halt_reason = "券商連線中斷"
+            self._halt_type = "connection_lost"
             logger.error("🚨 緊急停機: 券商連線中斷")
 
     def on_connection_restored(self):
         """連線恢復"""
         with self._lock:
-            if self._state == CircuitState.EMERGENCY_STOP and "連線" in self._halt_reason:
+            if (
+                self._state == CircuitState.EMERGENCY_STOP
+                and (self._halt_type == "connection_lost" or "連線" in self._halt_reason)
+            ):
                 self._state = CircuitState.ACTIVE
+                self._halt_reason = ""
+                self._halt_type = ""
                 logger.info("✅ 連線恢復，解除緊急停機")
+
+    def on_price_anomaly(self, reason: str):
+        """價格異常：與券商連線中斷分開記錄"""
+        with self._lock:
+            self._state = CircuitState.EMERGENCY_STOP
+            self._halt_reason = reason
+            self._halt_type = "price_anomaly"
+            logger.error(f"🚨 緊急停機: {reason}")
 
     def manual_resume(self):
         """手動恢復交易"""
@@ -162,6 +180,7 @@ class CircuitBreaker:
             old_state = self._state
             self._state = CircuitState.ACTIVE
             self._halt_reason = ""
+            self._halt_type = ""
             self._consecutive_losses = 0
             logger.info(f"🔄 手動恢復交易（從 {old_state.value}）")
 
@@ -170,6 +189,7 @@ class CircuitBreaker:
         self._state = CircuitState.COOLDOWN
         self._cooldown_until = datetime.now() + timedelta(minutes=self.cooldown_minutes)
         self._halt_reason = reason
+        self._halt_type = "cooldown"
         logger.warning(
             f"⏸️ 進入冷卻 {self.cooldown_minutes} 分鐘: {reason}"
         )
@@ -195,6 +215,7 @@ class CircuitBreaker:
             "state": state.value,
             "can_trade": state == CircuitState.ACTIVE,
             "halt_reason": self._halt_reason,
+            "halt_type": self._halt_type,
             "daily_loss": round(self._daily_loss, 0),
             "max_daily_loss": self.max_daily_loss,
             "daily_loss_pct": round(self._daily_loss / self.max_daily_loss * 100, 1) if self.max_daily_loss > 0 else 0,
