@@ -41,6 +41,7 @@ from strategy.gold_trend import GoldTrendStrategy
 from strategy.filters import MarketRegime, SessionManager, SessionPhase
 from risk.manager import RiskManager
 from core.performance import PerformanceTracker
+from core.paper_account import PaperAccountStore
 from intelligence.data_collector import DataCollector
 from intelligence.left_side_score import LeftSideScoreEngine
 
@@ -125,6 +126,9 @@ class TradingEngine:
 
         # 績效
         self.performance: Optional[PerformanceTracker] = None
+        self.paper_account_store: Optional[PaperAccountStore] = None
+        self.account_balance_source: str = "initial_balance"
+        self.account_balance_warnings: list[str] = []
 
         # Dashboard
         self._ws_broadcast: Optional[Callable] = None
@@ -251,7 +255,19 @@ class TradingEngine:
         self.risk_manager = RiskManager(profile=self.risk_profile)
 
         # ---- 部位管理（多商品共用餘額）----
-        initial_balance = float(os.getenv("INITIAL_BALANCE", "0"))
+        env_initial_balance = float(os.getenv("INITIAL_BALANCE", "0"))
+        initial_balance = env_initial_balance
+        self.account_balance_source = "initial_balance"
+        self.account_balance_warnings = []
+        self.paper_account_store = PaperAccountStore(PROJECT_ROOT)
+        if self.trading_mode == "paper":
+            initial_balance, self.account_balance_source, self.account_balance_warnings = (
+                self.paper_account_store.resolve_initial_balance(
+                    trading_mode=self.trading_mode,
+                    instruments=self.instruments,
+                    env_initial_balance=env_initial_balance,
+                )
+            )
         configs = {code: get_spec(code) for code in self.instruments}
         self.position_manager = PositionManager(
             instruments=self.instruments,
@@ -259,7 +275,9 @@ class TradingEngine:
             initial_balance=initial_balance,
         )
         if initial_balance > 0:
-            logger.info(f"[Account] balance: {initial_balance:,.0f}")
+            logger.info(f"[Account] balance: {initial_balance:,.0f} ({self.account_balance_source})")
+        for warning in self.account_balance_warnings:
+            logger.warning(f"[PaperAccount] {warning}")
 
         # ---- 績效追蹤 ----
         perf_dir = str(PROJECT_ROOT / "data" / "performance")
@@ -268,6 +286,7 @@ class TradingEngine:
             trading_mode=self.trading_mode,
         )
         self.performance.starting_balance = initial_balance
+        self._save_paper_account_state("engine_initialize")
 
         # ---- Intelligence ----
         self.data_collector = DataCollector()
@@ -476,6 +495,7 @@ class TradingEngine:
                 self.performance.on_session_end(self.position_manager.balance)
             except Exception as e:
                 logger.warning(f"[Performance] session end error: {e}")
+        self._save_paper_account_state("engine_stop")
 
         self._running = False
         self.state = EngineState.STOPPED
@@ -568,6 +588,7 @@ class TradingEngine:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
+        self._save_paper_account_state("manual_open")
 
         self._broadcast("trade", {
             "time": datetime.now().isoformat(),
@@ -638,6 +659,7 @@ class TradingEngine:
                     logger.info(f"[RiskProfile] {code} 持倉更新: SL={pos.stop_loss} TP={pos.take_profit} (ATR={atr:.1f}×{sl_mult:.1f})")
 
         self._broadcast("settings", {"risk_profile": profile})
+        self._save_paper_account_state("risk_profile_update")
 
     def set_ws_broadcast(self, callback: Callable):
         self._ws_broadcast = callback
@@ -855,6 +877,7 @@ class TradingEngine:
                         try:
                             self.performance.on_session_end(self.position_manager.balance)
                             self._session_ended_today = datetime.now().strftime("%Y-%m-%d")
+                            self._save_paper_account_state("session_end")
                         except Exception:
                             pass
             return
@@ -934,6 +957,7 @@ class TradingEngine:
                 take_profit=signal.take_profit,
                 take_profit_levels=signal.take_profit_levels,
             )
+            self._save_paper_account_state("paper_entry")
 
             signal_data = {
                 "time": datetime.now().isoformat(),
@@ -1081,6 +1105,7 @@ class TradingEngine:
 
             if trade and self.risk_manager:
                 self.risk_manager.on_trade_closed(trade.net_pnl)
+                self._save_paper_account_state("paper_exit")
 
             if self.performance:
                 if trade:
@@ -1179,6 +1204,18 @@ class TradingEngine:
             source="Engine",
         )
         self._execute_exit(instrument, signal, price)
+
+    def _save_paper_account_state(self, source: str):
+        """Persist paper balance without restoring or changing strategy state."""
+        if self.trading_mode != "paper" or not self.paper_account_store or not self.position_manager:
+            return
+        self.paper_account_store.save(
+            trading_mode=self.trading_mode,
+            risk_profile=self.risk_profile,
+            instruments=self.instruments,
+            position_manager=self.position_manager,
+            source=source,
+        )
 
     def _heartbeat(self):
         for inst in self.instruments:
@@ -1349,6 +1386,7 @@ class TradingEngine:
             "margin_used": round(margin_used, 0),
             "margin_available": round(equity - margin_used, 0),
             "unrealized_pnl": round(total_unrealized, 0),
+            "balance_source": self.account_balance_source,
         }
 
         intel_data = {}
