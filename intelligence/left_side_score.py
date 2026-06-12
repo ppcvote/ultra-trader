@@ -11,7 +11,7 @@ UltraTrader Intelligence — 左側交易評分引擎
 from dataclasses import dataclass
 from typing import Optional
 
-from intelligence.models import IntelligenceSnapshot
+from intelligence.models import FACTOR_SOURCES, IntelligenceSnapshot
 
 
 @dataclass
@@ -24,11 +24,26 @@ class FactorResult:
     confidence: float   # 0~1 信心度（資料品質）
     detail: str         # 說明文字
     level: str          # "extreme" / "strong" / "moderate" / "neutral"
+    status: str = ""    # LIVE / LIVE_NEW / STUB
+    source: str = ""    # 資料來源
+    scope: str = ""     # 資料口徑
+    factor: int = 0     # 因子編號
+
+    def __post_init__(self):
+        meta = FACTOR_SOURCES.get(self.name, {})
+        self.status = self.status or meta.get("status", "LIVE")
+        self.source = self.source or meta.get("source", "")
+        self.scope = self.scope or meta.get("scope", "")
+        self.factor = self.factor or int(meta.get("factor", 0) or 0)
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "name_zh": self.name_zh,
+            "factor": self.factor,
+            "status": self.status,
+            "source": self.source,
+            "scope": self.scope,
             "score": round(self.score, 3),
             "weight": self.weight,
             "weighted": round(self.score * self.weight, 3),
@@ -141,8 +156,20 @@ class LeftSideScoreEngine:
         因子 1：外資期貨淨OI（20%）
         邏輯：外資大幅偏空 → 可能是底部 → 左側做多
         """
+        if not snap.institutional_futures.date:
+            return FactorResult(
+                name="foreign_futures",
+                name_zh="外資期貨",
+                score=0.0,
+                weight=self.WEIGHTS["foreign_futures"],
+                confidence=0.0,
+                detail="資料未更新: TAIFEX 三大法人大台契約",
+                level="neutral",
+                status="STUB",
+            )
+
         net_oi = snap.institutional_futures.foreign_oi_net
-        confidence = 0.8 if net_oi != 0 else 0.0
+        confidence = 0.8
 
         # 正規化：以 ±20000 口為滿分基準
         # 注意是「逆向」：外資大空 → 正分（做多）
@@ -180,6 +207,7 @@ class LeftSideScoreEngine:
             confidence=confidence,
             detail=detail,
             level=level,
+            status="LIVE_NEW",
         )
 
     def _score_pc_ratio(self, snap: IntelligenceSnapshot) -> FactorResult:
@@ -276,8 +304,28 @@ class LeftSideScoreEngine:
         因子 4：外資現貨買賣超（12%）
         邏輯：外資連續大賣超 → 可能到底 → 左側做多
         """
+        if snap.institutional_spot.status != "LIVE" or not snap.institutional_spot.date:
+            status = snap.institutional_spot.status or "NO_DATA"
+            is_cache = status == "STALE_DISPLAY"
+            detail = "BFI82U 快取顯示，不參與評分" if is_cache else "BFI82U 未更新"
+            if snap.institutional_spot.date:
+                detail += f"；最後資料 {snap.institutional_spot.date}"
+            if snap.institutional_spot.error:
+                detail += f"；{snap.institutional_spot.error}"
+            return FactorResult(
+                name="foreign_spot",
+                name_zh="外資現貨",
+                score=0.0,
+                weight=self.WEIGHTS["foreign_spot"],
+                confidence=0.0,
+                detail=detail,
+                level="neutral",
+                status=status,
+                scope="快取顯示，不參與評分" if is_cache else "BFI82U 未更新",
+            )
+
         buy_sell = snap.institutional_spot.foreign_buy_sell  # 億元
-        confidence = 0.7 if buy_sell != 0 else 0.0
+        confidence = 0.7
 
         score = 0.0
         level = "neutral"
@@ -319,30 +367,56 @@ class LeftSideScoreEngine:
         因子 5：融資融券（10%）
         邏輯：融資大幅減少（斷頭）→ 散戶絕望 → 底部接近
         """
-        change = snap.margin.margin_change  # 億元
-        confidence = 0.6 if change != 0 else 0.0
+        change = snap.margin.margin_change  # 交易單位
+        change_pct = snap.margin.margin_change_pct
+        has_data = (
+            snap.margin.status == "LIVE"
+            and (snap.margin.margin_balance != 0 or snap.margin.margin_previous_balance != 0)
+        )
+        if not has_data:
+            status = snap.margin.status or "NO_DATA"
+            detail = "MI_MARGN 未更新"
+            if snap.margin.date:
+                detail += f"；最後資料 {snap.margin.date}"
+            if snap.margin.error:
+                detail += f"；{snap.margin.error}"
+            return FactorResult(
+                name="margin",
+                name_zh="融資",
+                score=0.0,
+                weight=self.WEIGHTS["margin"],
+                confidence=0.0,
+                detail=detail,
+                level="neutral",
+                status=status,
+                scope="MI_MARGN 未更新",
+            )
+
+        confidence = 0.6 if has_data else 0.0
 
         score = 0.0
         level = "neutral"
 
-        if change < -50:
+        if change_pct < -3.0:
             score = 0.8     # 融資大減（斷頭）→ 左側做多
             level = "extreme"
-        elif change < -20:
+        elif change_pct < -1.5:
             score = 0.4
             level = "strong"
-        elif change < -5:
+        elif change_pct < -0.5:
             score = 0.1
             level = "moderate"
-        elif change > 50:
+        elif change_pct > 3.0:
             score = -0.6    # 融資大增（散戶追高）→ 左側做空
             level = "strong"
-        elif change > 20:
+        elif change_pct > 1.5:
             score = -0.3
             level = "moderate"
 
-        detail = f"融資 {change:+.1f}億"
-        if change < -20:
+        detail = f"融資 {change_pct:+.2f}%"
+        if has_data:
+            detail += f" 今日{snap.margin.margin_balance:,.0f}"
+        if change_pct < -1.5:
             detail += " 斷頭"
 
         return FactorResult(
@@ -360,8 +434,20 @@ class LeftSideScoreEngine:
         因子 6：大額交易人集中度（8%）
         邏輯：前十大交易人極度偏多/偏空 → 可能反轉
         """
+        if not snap.large_trader.date:
+            return FactorResult(
+                name="large_trader",
+                name_zh="大額交易人",
+                score=0.0,
+                weight=self.WEIGHTS["large_trader"],
+                confidence=0.0,
+                detail="資料未更新: TAIFEX 大額交易人 TX 所有契約",
+                level="neutral",
+                status="STUB",
+            )
+
         net = snap.large_trader.top10_net
-        confidence = 0.7 if net != 0 else 0.0
+        confidence = 0.7
 
         score = 0.0
         level = "neutral"
@@ -390,6 +476,7 @@ class LeftSideScoreEngine:
             confidence=confidence,
             detail=detail,
             level=level,
+            status="LIVE_NEW",
         )
 
     def _score_us_market(self, snap: IntelligenceSnapshot) -> FactorResult:
@@ -477,30 +564,49 @@ class LeftSideScoreEngine:
     def _score_trust(self, snap: IntelligenceSnapshot) -> FactorResult:
         """
         因子 9：投信動向（7%）
-        邏輯：投信從賣轉買 → 法人止血 → 可能轉折
-        投信通常是最後認錯的一群，他們開始止血買回 = 接近底部
+        邏輯：本版只使用投信現貨買賣超，不把未接的投信期貨 OI 當真資料。
         """
-        trust_oi = snap.institutional_futures.trust_oi_net
+        if snap.institutional_spot.status != "LIVE" or not snap.institutional_spot.date:
+            status = snap.institutional_spot.status or "NO_DATA"
+            is_cache = status == "STALE_DISPLAY"
+            detail = "BFI82U 快取顯示，不參與評分" if is_cache else "BFI82U 未更新"
+            if snap.institutional_spot.date:
+                detail += f"；最後資料 {snap.institutional_spot.date}"
+            if snap.institutional_spot.error:
+                detail += f"；{snap.institutional_spot.error}"
+            return FactorResult(
+                name="trust",
+                name_zh="投信",
+                score=0.0,
+                weight=self.WEIGHTS["trust"],
+                confidence=0.0,
+                detail=detail,
+                level="neutral",
+                status=status,
+                scope="快取顯示，不參與評分" if is_cache else "BFI82U 未更新",
+            )
+
         trust_spot = snap.institutional_spot.trust_buy_sell
-        confidence = 0.5 if trust_oi != 0 or trust_spot != 0 else 0.0
+        confidence = 0.5
 
         score = 0.0
         level = "neutral"
 
-        # 投信期貨和現貨都偏空但開始減少空頭 → 轉折
-        if trust_oi < -3000:
-            score = 0.4     # 投信大空 → 可能到底（投信常在底部放空）
+        # 左側邏輯：投信現貨大賣視為偏恐慌，大買視為偏擁擠。
+        if trust_spot < -50:
+            score = 0.4
             level = "strong"
-        elif trust_oi < -1000:
+        elif trust_spot < -20:
             score = 0.2
             level = "moderate"
-        elif trust_oi > 3000:
-            score = -0.4    # 投信大多 → 可能到頂
+        elif trust_spot > 50:
+            score = -0.4
             level = "strong"
+        elif trust_spot > 20:
+            score = -0.2
+            level = "moderate"
 
-        detail = f"投信淨OI {trust_oi:+,d}"
-        if trust_spot != 0:
-            detail += f" 現貨{trust_spot:+.1f}億"
+        detail = f"投信現貨 {trust_spot:+.1f}億"
 
         return FactorResult(
             name="trust",
