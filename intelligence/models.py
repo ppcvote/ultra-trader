@@ -8,6 +8,68 @@ from datetime import datetime, date
 from typing import Optional
 
 
+FACTOR_SOURCES = {
+    "foreign_futures": {
+        "factor": 1,
+        "status": "LIVE_NEW",
+        "source": "TAIFEX 三大法人區分各期貨契約 CSV",
+        "scope": "大台契約",
+    },
+    "pc_ratio": {
+        "factor": 2,
+        "status": "LIVE",
+        "source": "TAIFEX pcRatioDown POST",
+        "scope": "全市場 Put/Call Ratio",
+    },
+    "vix": {
+        "factor": 3,
+        "status": "LIVE",
+        "source": "yfinance ^VIX",
+        "scope": "VIX",
+    },
+    "foreign_spot": {
+        "factor": 4,
+        "status": "LIVE",
+        "source": "TWSE BFI82U JSON",
+        "scope": "外資現貨買賣超",
+    },
+    "margin": {
+        "factor": 5,
+        "status": "LIVE_NEW",
+        "source": "TWSE OpenAPI MI_MARGN",
+        "scope": "全市場加總",
+    },
+    "large_trader": {
+        "factor": 6,
+        "status": "LIVE_NEW",
+        "source": "TAIFEX 大額交易人 CSV",
+        "scope": "TX 所有契約大台等值",
+    },
+    "us_market": {
+        "factor": 7,
+        "status": "LIVE",
+        "source": "yfinance ES=F / NQ=F",
+        "scope": "美股期貨",
+    },
+    "sox": {
+        "factor": 8,
+        "status": "LIVE",
+        "source": "yfinance ^SOX",
+        "scope": "費城半導體指數",
+    },
+    "trust": {
+        "factor": 9,
+        "status": "LIVE_NEW",
+        "source": "TWSE BFI82U JSON",
+        "scope": "投信現貨買賣超",
+    },
+}
+
+
+def default_factor_sources() -> dict:
+    return {name: dict(meta) for name, meta in FACTOR_SOURCES.items()}
+
+
 # ============================================================
 # 三大法人資料
 # ============================================================
@@ -48,7 +110,12 @@ class InstitutionalFutures:
 class InstitutionalSpot:
     """三大法人現貨買賣超"""
     date: date = None
+    fetched_at: datetime = None
+    status: str = "NO_DATA"  # LIVE / STALE_DISPLAY / NO_DATA
+    error: str = ""
+    source: str = ""
     foreign_buy_sell: float = 0.0   # 外資買賣超（億元）
+    foreign_dealer_buy_sell: float = 0.0  # 外資自營商買賣超（億元）
     trust_buy_sell: float = 0.0     # 投信買賣超（億元）
     dealer_buy_sell: float = 0.0    # 自營買賣超（億元）
     total_buy_sell: float = 0.0     # 合計（億元）
@@ -119,10 +186,16 @@ class LargeTraderOI:
 class MarginData:
     """融資融券資料"""
     date: date = None
-    margin_balance: float = 0.0     # 融資餘額（億元）
-    margin_change: float = 0.0      # 融資增減
-    short_balance: float = 0.0      # 融券餘額（張）
-    short_change: float = 0.0       # 融券增減
+    fetched_at: datetime = None
+    status: str = "NO_DATA"
+    error: str = ""
+    margin_balance: float = 0.0     # 融資今日餘額（交易單位，全市場加總）
+    margin_previous_balance: float = 0.0  # 融資前日餘額（交易單位，全市場加總）
+    margin_change: float = 0.0      # 融資增減（交易單位）
+    margin_change_pct: float = 0.0  # 融資餘額百分比變化
+    short_balance: float = 0.0      # 融券今日餘額（交易單位，全市場加總）
+    short_previous_balance: float = 0.0  # 融券前日餘額（交易單位，全市場加總）
+    short_change: float = 0.0       # 融券增減（交易單位）
     margin_usage_rate: float = 0.0  # 融資使用率 %
 
 
@@ -194,9 +267,39 @@ class IntelligenceSnapshot:
 
     # 資料新鮮度
     data_freshness: dict = field(default_factory=dict)  # 各資料源最後更新時間
+    factor_sources: dict = field(default_factory=default_factor_sources)
 
     def to_dict(self) -> dict:
         """轉換為 dict（供 API / WebSocket 使用）"""
+        factor_sources = default_factor_sources()
+        if not self.institutional_futures.date:
+            factor_sources["foreign_futures"]["status"] = "STUB"
+            factor_sources["foreign_futures"]["scope"] = "資料未更新"
+        if not self.large_trader.date:
+            factor_sources["large_trader"]["status"] = "STUB"
+            factor_sources["large_trader"]["scope"] = "資料未更新"
+        if self.institutional_spot.status != "LIVE":
+            status = self.institutional_spot.status or "NO_DATA"
+            factor_sources["foreign_spot"]["status"] = status
+            factor_sources["foreign_spot"]["scope"] = (
+                "快取顯示，不參與評分"
+                if status == "STALE_DISPLAY"
+                else "BFI82U 未更新"
+            )
+            if self.institutional_spot.source:
+                factor_sources["foreign_spot"]["source"] = self.institutional_spot.source
+            factor_sources["trust"]["status"] = status
+            factor_sources["trust"]["scope"] = (
+                "快取顯示，不參與評分"
+                if status == "STALE_DISPLAY"
+                else "BFI82U 未更新"
+            )
+            if self.institutional_spot.source:
+                factor_sources["trust"]["source"] = self.institutional_spot.source
+        if self.margin.status != "LIVE":
+            factor_sources["margin"]["status"] = self.margin.status or "NO_DATA"
+            factor_sources["margin"]["scope"] = "MI_MARGN 未更新"
+
         return {
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
             "left_side": {
@@ -212,6 +315,15 @@ class IntelligenceSnapshot:
                 "dealer_oi_net": self.institutional_futures.dealer_oi_net,
                 "total_oi_net": self.institutional_futures.total_oi_net,
                 "foreign_spot_buy_sell": self.institutional_spot.foreign_buy_sell,
+                "foreign_dealer_spot_buy_sell": self.institutional_spot.foreign_dealer_buy_sell,
+                "trust_spot_buy_sell": self.institutional_spot.trust_buy_sell,
+                "dealer_spot_buy_sell": self.institutional_spot.dealer_buy_sell,
+                "total_spot_buy_sell": self.institutional_spot.total_buy_sell,
+                "spot_date": self.institutional_spot.date.isoformat() if self.institutional_spot.date else None,
+                "spot_fetched_at": self.institutional_spot.fetched_at.isoformat() if self.institutional_spot.fetched_at else None,
+                "spot_status": self.institutional_spot.status,
+                "spot_error": self.institutional_spot.error,
+                "spot_source": self.institutional_spot.source,
             },
             "options": {
                 "pc_ratio_oi": self.options.pc_ratio_oi,
@@ -232,11 +344,22 @@ class IntelligenceSnapshot:
                 "top5_net": self.large_trader.top5_net,
                 "top10_net": self.large_trader.top10_net,
                 "concentration": round(self.large_trader.concentration_ratio, 1),
+                "total_oi": self.large_trader.total_oi,
             },
             "margin": {
                 "margin_balance": self.margin.margin_balance,
+                "margin_previous_balance": self.margin.margin_previous_balance,
                 "margin_change": self.margin.margin_change,
+                "margin_change_pct": round(self.margin.margin_change_pct, 3),
+                "short_balance": self.margin.short_balance,
+                "short_previous_balance": self.margin.short_previous_balance,
+                "short_change": self.margin.short_change,
                 "usage_rate": self.margin.margin_usage_rate,
+                "date": self.margin.date.isoformat() if self.margin.date else None,
+                "fetched_at": self.margin.fetched_at.isoformat() if self.margin.fetched_at else None,
+                "status": self.margin.status,
+                "error": self.margin.error,
             },
             "freshness": self.data_freshness,
+            "factor_sources": factor_sources,
         }
